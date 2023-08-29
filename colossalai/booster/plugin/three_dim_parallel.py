@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from colossalai.amp.naive_amp.mixed_precision_optimizer import MixedPrecisionOptimizer
-from colossalai.checkpoint_io import CheckpointIO
+from colossalai.checkpoint_io import CheckpointIO,HypridParallelCheckpointIO
 from colossalai.cluster import ProcessGroupMesh
 from colossalai.interface import ModelWrapper, OptimizerWrapper
 from colossalai.pipeline.schedule import OneForwardOneBackwardSchedule
@@ -36,10 +36,11 @@ class PipelineModule(ModelWrapper):
         shardformer = ShardFormer(shard_config)
         module, self.shared_params = shardformer.optimize(module)
         # TODO(ver217): add zero here
-        # self.shared_param_process_groups = []
-        # for shared_param in self.shared_params:
-        #     if len(shared_param) > 0:
-        #         stage_manager.init_process_group_by_stages(list(shared_param.keys()))
+        self.shared_param_process_groups = []
+        for shared_param in self.shared_params:
+            if len(shared_param) > 0:
+                self.shared_param_process_groups.append(
+                    self.stage_manager.init_process_group_by_stages(list(shared_param.keys())))
         if precision == 'fp16':
             module = module.half().cuda()
         elif precision == 'bf16':
@@ -48,8 +49,10 @@ class PipelineModule(ModelWrapper):
 
     def sync_shared_params(self):
         for shared_param, group in zip(self.shared_params, self.shared_param_process_groups):
-            param = shared_param[self.stage_manager.stage]
-            dist.all_reduce(param.grad, group=group)
+            if self.stage_manager.stage in shared_param:
+                param = shared_param[self.stage_manager.stage]
+                dist.all_reduce(param.grad, group=group)
+            dist.barrier()
 
     def no_sync(self) -> Iterator[None]:
         # no sync grads across data parallel
@@ -62,6 +65,7 @@ class PipelineModule(ModelWrapper):
         for p in self.module.parameters():
             if p.grad is not None:
                 dist.all_reduce(p.grad, group=self.dp_group)
+                p.grad.div_(self.dp_group.size())
 
 
 def init_pipeline_optimizer(optim: Optimizer, model: Module):
@@ -163,6 +167,7 @@ class ThreeDimParallelPlugin(PipelinePluginBase):
             self.schedule = OneForwardOneBackwardSchedule(num_microbatches, self.stage_manager)
         self.tp_group = self.pg_mesh.get_group_along_axis(TP_AXIS)
         self.dp_group = self.pg_mesh.get_group_along_axis(DP_AXIS)
+        self.pp_group = self.pg_mesh.get_group_along_axis(PP_AXIS)
         self.shard_config = ShardConfig(tensor_parallel_process_group=self.tp_group,
                                         pipeline_stage_manager=self.stage_manager,
                                         enable_tensor_parallelism=self.tp_size > 1,
@@ -236,7 +241,7 @@ class ThreeDimParallelPlugin(PipelinePluginBase):
         with ctx:
             outputs = self.schedule.forward_backward_step(model, optimizer, data_iter, criterion, return_loss,
                                                           return_outputs)
-        # model.sync_shared_params()
+        model.sync_shared_params()
         if isinstance(optimizer, PipelineZeroOptimizer):
             optimizer.sync_grad()
         else:
@@ -296,7 +301,7 @@ class ThreeDimParallelPlugin(PipelinePluginBase):
                           **_kwargs)
 
     def get_checkpoint_io(self) -> CheckpointIO:
-        return None
+        return HypridParallelCheckpointIO(self.dp_group, self.pp_group, self.tp_group)
 
     def no_sync(self, model: Module) -> Iterator[None]:
         raise NotImplementedError
